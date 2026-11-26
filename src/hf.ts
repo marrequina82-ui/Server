@@ -98,7 +98,7 @@ const round = (n: number, d = 0) => Math.round(n * 10 ** d) / 10 ** d;
 
 // ---------- prompts ----------
 const MEAL_SHAPE = `{"is_food": true, "meal_name": "string", "items": [{"name": "string", "grams": 0, "kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0}], "confidence": "low|medium|high", "notes": "one short sentence"}`;
-const LABEL_SHAPE = `{"is_label": true, "product_name": "string", "serving_desc": "string", "serving_g": 0, "servings_per_container": 0, "kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0, "sugar_g": 0, "sodium_mg": 0, "notes": "string"}`;
+const LABEL_SHAPE = `{"is_label": true, "product_name": "string", "serving_desc": "string", "serving_g": 0, "servings_per_container": 0, "kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "notes": "string"}`;
 
 function mealPrompt(totalGrams: number | null, note: string | null): string {
   const weight = totalGrams
@@ -116,7 +116,7 @@ function mealPrompt(totalGrams: number | null, note: string | null): string {
 }
 
 const LABEL_PROMPT = [
-  "Read the Nutrition Facts label in this photo. Report the values for ONE serving as printed.",
+  "Read the Nutrition Facts label in this photo. Report only calories, protein, carbs and fat for ONE serving as printed.",
   "If only per-100 g values are printed, use serving_desc \"100 g\" and serving_g 100.",
   "Use null for values you cannot read. Do not guess. Convert kJ to kcal if only kJ is shown.",
   `Reply with ONLY a JSON object, no other text, in exactly this shape: ${LABEL_SHAPE}`,
@@ -157,9 +157,6 @@ export function toLabel(raw: any): LabelAnalysis {
     protein_g: round(num(raw?.protein_g), 1),
     carbs_g: round(num(raw?.carbs_g), 1),
     fat_g: round(num(raw?.fat_g), 1),
-    fiber_g: numOrNull(raw?.fiber_g),
-    sugar_g: numOrNull(raw?.sugar_g),
-    sodium_mg: numOrNull(raw?.sodium_mg),
     notes: str(raw?.notes, ""),
   };
 }

@@ -80,6 +80,22 @@ CREATE TABLE IF NOT EXISTS weight_logs (
 );
 `);
 
+const userCols = db.prepare("PRAGMA table_info(users)").all() as unknown as { name: string }[];
+if (!userCols.some((c) => c.name === "avatar")) {
+  // "preset:<id>" for a built-in avatar, or a small "data:image/jpeg;base64,..." photo.
+  db.exec("ALTER TABLE users ADD COLUMN avatar TEXT");
+}
+if (!userCols.some((c) => c.name === "firebase_uid")) {
+  // Set once the account signs in through Firebase. NULL = old password account not moved yet.
+  db.exec("ALTER TABLE users ADD COLUMN firebase_uid TEXT");
+}
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid ON users(firebase_uid)");
+
+const profileCols = db.prepare("PRAGMA table_info(profiles)").all() as unknown as { name: string }[];
+if (!profileCols.some((c) => c.name === "macro_style")) {
+  db.exec("ALTER TABLE profiles ADD COLUMN macro_style TEXT NOT NULL DEFAULT 'balanced'");
+}
+
 const count = (db.prepare("SELECT COUNT(*) AS n FROM foods WHERE source = 'seed'").get() as unknown as { n: number }).n;
 if (count === 0) {
   const insert = db.prepare(

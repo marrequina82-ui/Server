@@ -3,13 +3,14 @@ import express, { type NextFunction, type Request, type Response } from "express
 import cors from "cors";
 import Anthropic from "@anthropic-ai/sdk";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
+import type { DecodedIdToken } from "firebase-admin/auth";
 import { z } from "zod";
 import { db, transaction } from "./db.js";
 import { computeTargets, type ProfileInput } from "./nutrition.js";
 import { AiError, analyzeLabel, analyzeMeal } from "./ai.js";
+import { adminAuth } from "./firebase.js";
+import { OAuthError, verifyDiscord } from "./oauth.js";
 
-const JWT_SECRET = process.env.JWT_SECRET ?? "dev-only-change-me";
 const PORT = Number(process.env.PORT ?? 4000);
 
 const app = express();
@@ -17,23 +18,50 @@ app.use(cors());
 app.use(express.json({ limit: "12mb" })); // base64 photos
 
 // ---------- helpers ----------
-type AuthedRequest = Request & { userId: number };
+type AuthedRequest = Request & { fb: DecodedIdToken; userId: number };
 
-function auth(req: Request, res: Response, next: NextFunction) {
+/** Verifies the Firebase ID token in the Authorization header. Does not touch the local users table. */
+async function firebaseAuth(req: Request, res: Response, next: NextFunction) {
   const header = req.headers.authorization ?? "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Not signed in" });
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as { sub: string };
-    (req as AuthedRequest).userId = Number(payload.sub);
+    (req as AuthedRequest).fb = await adminAuth().verifyIdToken(token);
     next();
-  } catch {
+  } catch (e) {
+    if (e instanceof Error && /FIREBASE_SERVICE_ACCOUNT/.test(e.message)) return res.status(500).json({ error: e.message });
     res.status(401).json({ error: "Session expired, please sign in again" });
   }
 }
 
+/** Local user for this Firebase account: linked by uid, else by verified email, else created. */
+function localUserFor(fb: DecodedIdToken): number {
+  const linked = db.prepare("SELECT id FROM users WHERE firebase_uid = ?").get(fb.uid) as unknown as { id: number } | undefined;
+  if (linked) return linked.id;
+  const email = fb.email?.toLowerCase();
+  if (email && fb.email_verified) {
+    const existing = db.prepare("SELECT id FROM users WHERE email = ? AND firebase_uid IS NULL").get(email) as unknown as { id: number } | undefined;
+    if (existing) {
+      db.prepare("UPDATE users SET firebase_uid = ? WHERE id = ?").run(fb.uid, existing.id);
+      return existing.id;
+    }
+  }
+  // An unverified email may belong to an old account; keep it unique by not reusing it.
+  const taken = email && db.prepare("SELECT 1 FROM users WHERE email = ?").get(email);
+  const storedEmail = email && !taken ? email : `${fb.uid}@users.fittonesugo.local`;
+  const name = (fb.name as string | undefined) || email?.split("@")[0] || "FittonesuGo user";
+  return Number(db.prepare("INSERT INTO users (email, password_hash, name, firebase_uid) VALUES (?, '', ?, ?)").run(storedEmail, name, fb.uid).lastInsertRowid);
+}
+
+function auth(req: Request, res: Response, next: NextFunction) {
+  firebaseAuth(req, res, () => {
+    const r = req as AuthedRequest;
+    r.userId = localUserFor(r.fb);
+    next();
+  });
+}
+
 const uid = (req: Request) => (req as AuthedRequest).userId;
-const sign = (id: number) => jwt.sign({}, JWT_SECRET, { subject: String(id), expiresIn: "30d" });
 
 function parse<T>(schema: z.ZodType<T>, data: unknown, res: Response): T | null {
   const r = schema.safeParse(data);
@@ -48,26 +76,54 @@ const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const mealEnum = z.enum(["breakfast", "lunch", "dinner", "snacks"]);
 const mediaType = z.enum(["image/jpeg", "image/png", "image/webp"]).default("image/jpeg");
 
-// ---------- auth ----------
-app.post("/auth/register", (req, res) => {
-  const body = parse(z.object({ name: z.string().min(1), email: z.email(), password: z.string().min(8) }), req.body, res);
-  if (!body) return;
-  const exists = db.prepare("SELECT id FROM users WHERE email = ?").get(body.email.toLowerCase());
-  if (exists) return res.status(409).json({ error: "That email is already registered" });
-  const hash = bcrypt.hashSync(body.password, 10);
-  const info = db.prepare("INSERT INTO users (email, password_hash, name) VALUES (?, ?, ?)").run(body.email.toLowerCase(), hash, body.name);
-  const id = Number(info.lastInsertRowid);
-  res.json({ token: sign(id), user: { id, name: body.name, email: body.email.toLowerCase() } });
+// ---------- auth (Firebase) ----------
+const legacyBody = z.object({ email: z.email(), password: z.string().min(1) });
+
+function legacyUser(email: string, password: string) {
+  const u = db.prepare("SELECT id, password_hash FROM users WHERE email = ? AND firebase_uid IS NULL").get(email.toLowerCase()) as unknown as
+    | { id: number; password_hash: string }
+    | undefined;
+  return u && u.password_hash && bcrypt.compareSync(password, u.password_hash) ? u.id : null;
+}
+
+// Old (pre-Firebase) accounts: the app asks whether email + password match one before moving it to Firebase.
+app.post("/auth/legacy/check", (req, res) => {
+  const b = parse(legacyBody, req.body, res);
+  if (!b) return;
+  res.json({ ok: legacyUser(b.email, b.password) !== null });
 });
 
-app.post("/auth/login", (req, res) => {
-  const body = parse(z.object({ email: z.email(), password: z.string() }), req.body, res);
-  if (!body) return;
-  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(body.email.toLowerCase()) as unknown as
-    | { id: number; name: string; email: string; password_hash: string }
-    | undefined;
-  if (!user || !bcrypt.compareSync(body.password, user.password_hash)) return res.status(401).json({ error: "Wrong email or password" });
-  res.json({ token: sign(user.id), user: { id: user.id, name: user.name, email: user.email } });
+// Called right after the app created the Firebase account for an old user: links it to their existing data.
+app.post("/auth/legacy/link", firebaseAuth, (req, res) => {
+  const b = parse(legacyBody, req.body, res);
+  if (!b) return;
+  const fb = (req as AuthedRequest).fb;
+  if (fb.email?.toLowerCase() !== b.email.toLowerCase()) return res.status(403).json({ error: "Email doesn't match this session" });
+  const id = legacyUser(b.email, b.password);
+  if (id === null) return res.status(401).json({ error: "Wrong email or password" });
+  db.prepare("UPDATE users SET firebase_uid = ?, password_hash = '' WHERE id = ?").run(fb.uid, id);
+  res.json({ ok: true });
+});
+
+// Discord isn't a Firebase provider: verify it here and hand back a Firebase custom token.
+app.post("/auth/discord", async (req, res, next) => {
+  const b = parse(z.object({ code: z.string().min(1), code_verifier: z.string().min(43), redirect_uri: z.string().min(1), client_id: z.string().min(1) }), req.body, res);
+  if (!b) return;
+  try {
+    const who = await verifyDiscord(b);
+    const firebaseUid = `discord:${who.id}`;
+    const a = adminAuth();
+    try {
+      await a.getUser(firebaseUid);
+    } catch {
+      const emailFree = who.email ? await a.getUserByEmail(who.email).then(() => false, () => true) : false;
+      await a.createUser({ uid: firebaseUid, displayName: who.name, ...(who.email && emailFree ? { email: who.email, emailVerified: true } : {}) });
+    }
+    res.json({ firebase_token: await a.createCustomToken(firebaseUid) });
+  } catch (e) {
+    if (e instanceof OAuthError) return res.status(e.status).json({ error: e.message });
+    next(e);
+  }
 });
 
 // ---------- profile & goals ----------
@@ -80,10 +136,11 @@ const profileSchema = z.object({
   activity: z.enum(["sedentary", "light", "moderate", "active", "very_active"]),
   goal: z.enum(["lose", "maintain", "gain"]),
   weekly_rate_kg: z.number().refine((v) => [0, 0.25, 0.5, 0.75].includes(v), "must be 0, 0.25, 0.5 or 0.75"),
+  macro_style: z.enum(["balanced", "high_protein", "low_carb"]).default("balanced"),
 });
 
 app.get("/me", auth, (req, res) => {
-  const user = db.prepare("SELECT id, name, email FROM users WHERE id = ?").get(uid(req));
+  const user = db.prepare("SELECT id, name, email, avatar FROM users WHERE id = ?").get(uid(req));
   const profile = db.prepare("SELECT * FROM profiles WHERE user_id = ?").get(uid(req)) as unknown as ProfileInput | undefined;
   res.json({ user, profile: profile ?? null, targets: profile ? computeTargets(profile) : null });
 });
@@ -92,12 +149,27 @@ app.put("/profile", auth, (req, res) => {
   const p = parse(profileSchema, req.body, res);
   if (!p) return;
   db.prepare(
-    `INSERT INTO profiles (user_id, sex, birth_year, height_cm, weight_kg, goal_weight_kg, activity, goal, weekly_rate_kg, updated_at)
-     VALUES (@user_id, @sex, @birth_year, @height_cm, @weight_kg, @goal_weight_kg, @activity, @goal, @weekly_rate_kg, datetime('now'))
+    `INSERT INTO profiles (user_id, sex, birth_year, height_cm, weight_kg, goal_weight_kg, activity, goal, weekly_rate_kg, macro_style, updated_at)
+     VALUES (@user_id, @sex, @birth_year, @height_cm, @weight_kg, @goal_weight_kg, @activity, @goal, @weekly_rate_kg, @macro_style, datetime('now'))
      ON CONFLICT(user_id) DO UPDATE SET sex=@sex, birth_year=@birth_year, height_cm=@height_cm, weight_kg=@weight_kg,
-       goal_weight_kg=@goal_weight_kg, activity=@activity, goal=@goal, weekly_rate_kg=@weekly_rate_kg, updated_at=datetime('now')`
+       goal_weight_kg=@goal_weight_kg, activity=@activity, goal=@goal, weekly_rate_kg=@weekly_rate_kg, macro_style=@macro_style, updated_at=datetime('now')`
   ).run({ user_id: uid(req), ...p });
   res.json({ profile: p, targets: computeTargets(p) });
+});
+
+const avatarSchema = z.object({
+  avatar: z
+    .string()
+    .max(400_000, "photo is too large")
+    .regex(/^(preset:[a-z0-9_-]{1,32}|data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+)$/, "must be a preset or a JPEG/PNG photo")
+    .nullable(),
+});
+
+app.put("/me/avatar", auth, (req, res) => {
+  const b = parse(avatarSchema, req.body, res);
+  if (!b) return;
+  db.prepare("UPDATE users SET avatar = ? WHERE id = ?").run(b.avatar, uid(req));
+  res.json({ avatar: b.avatar });
 });
 
 app.post("/weight", auth, (req, res) => {
@@ -110,6 +182,45 @@ app.post("/weight", auth, (req, res) => {
 
 app.get("/weight", auth, (req, res) => {
   res.json(db.prepare("SELECT date, weight_kg FROM weight_logs WHERE user_id = ? ORDER BY date DESC LIMIT 90").all(uid(req)));
+});
+
+// ---------- privacy ----------
+app.get("/export", auth, (req, res) => {
+  const id = uid(req);
+  res.json({
+    exported_at: new Date().toISOString(),
+    user: db.prepare("SELECT id, name, email, created_at FROM users WHERE id = ?").get(id),
+    profile: db.prepare("SELECT * FROM profiles WHERE user_id = ?").get(id) ?? null,
+    diary: db.prepare("SELECT date, meal, name, amount_desc, kcal, protein_g, carbs_g, fat_g, source, created_at FROM diary_entries WHERE user_id = ? ORDER BY date, id").all(id),
+    weights: db.prepare("SELECT date, weight_kg FROM weight_logs WHERE user_id = ? ORDER BY date").all(id),
+    saved_foods: db.prepare("SELECT name, serving_desc, serving_g, kcal, protein_g, carbs_g, fat_g, source FROM foods WHERE created_by = ?").all(id),
+  });
+});
+
+app.delete("/diary", auth, (req, res) => {
+  const info = db.prepare("DELETE FROM diary_entries WHERE user_id = ?").run(uid(req));
+  res.json({ ok: true, deleted: Number(info.changes) });
+});
+
+app.post("/account/delete", auth, async (req, res, next) => {
+  const b = parse(z.object({ confirm: z.literal("DELETE") }), req.body, res);
+  if (!b) return;
+  const fb = (req as AuthedRequest).fb;
+  // Password accounts re-enter their password in the app first, which refreshes auth_time.
+  if (fb.firebase.sign_in_provider === "password" && Date.now() / 1000 - fb.auth_time > 300) {
+    return res.status(401).json({ error: "Please enter your password again to confirm" });
+  }
+  try {
+    transaction(() => {
+      // Saved foods would otherwise become visible to everyone once created_by is cleared.
+      db.prepare("DELETE FROM foods WHERE created_by = ?").run(uid(req));
+      db.prepare("DELETE FROM users WHERE id = ?").run(uid(req));
+    });
+    await adminAuth().deleteUser(fb.uid);
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
 });
 
 // ---------- foods ----------

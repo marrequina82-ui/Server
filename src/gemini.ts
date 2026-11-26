@@ -62,9 +62,6 @@ const labelSchema = {
     protein_g: { type: Type.NUMBER },
     carbs_g: { type: Type.NUMBER },
     fat_g: { type: Type.NUMBER },
-    fiber_g: { type: Type.NUMBER, nullable: true },
-    sugar_g: { type: Type.NUMBER, nullable: true },
-    sodium_mg: { type: Type.NUMBER, nullable: true },
     notes: { type: Type.STRING },
   },
   required: ["is_label", "product_name", "serving_desc", "kcal", "protein_g", "carbs_g", "fat_g", "notes"],
@@ -170,7 +167,7 @@ export async function geminiMeal(imageBase64: string, totalGrams?: number | null
 
 export async function geminiLabel(imageBase64: string): Promise<LabelAnalysis> {
   const prompt = [
-    "Read the Nutrition Facts label in this photo. Report values for ONE serving exactly as printed.",
+    "Read the Nutrition Facts label in this photo. Report only calories, protein, carbs and fat for ONE serving exactly as printed.",
     "serving_g is the serving size in grams (or ml for drinks). Convert kJ to kcal by dividing by 4.184 if only kJ is shown.",
     "Use null for optional values you cannot read. Do not guess. If there is no readable label, set is_label to false.",
   ].join("\n");

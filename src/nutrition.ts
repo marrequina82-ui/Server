@@ -1,8 +1,10 @@
 export type Sex = "female" | "male";
 export type Activity = "sedentary" | "light" | "moderate" | "active" | "very_active";
 export type Goal = "lose" | "maintain" | "gain";
+export type MacroStyle = "balanced" | "high_protein" | "low_carb";
 
 export interface ProfileInput {
+  macro_style?: MacroStyle;
   sex: Sex;
   birth_year: number;
   height_cm: number;
@@ -36,6 +38,12 @@ const ACTIVITY_FACTOR: Record<Activity, number> = {
 const KCAL_PER_KG = 7700;
 const MIN_CALORIES: Record<Sex, number> = { female: 1200, male: 1500 };
 
+const MACRO_STYLE: Record<MacroStyle, { proteinPerKg: number; fatShare: number }> = {
+  balanced: { proteinPerKg: 1.6, fatShare: 0.27 },
+  high_protein: { proteinPerKg: 2.0, fatShare: 0.25 },
+  low_carb: { proteinPerKg: 1.8, fatShare: 0.4 },
+};
+
 /** Mifflin–St Jeor BMR → TDEE → goal-adjusted target with safety floors. */
 export function computeTargets(p: ProfileInput, now = new Date()): Targets {
   const age = now.getFullYear() - p.birth_year;
@@ -63,10 +71,11 @@ export function computeTargets(p: ProfileInput, now = new Date()): Targets {
     warnings.push(`Your target was raised to the ${MIN_CALORIES[p.sex]} kcal minimum. Try a slower weekly rate or add activity instead.`);
   }
 
-  // Macros: protein 1.6 g/kg (capped at goal-relevant weight), fat 27%, rest carbs
+  // Macros: protein g/kg (capped at goal-relevant weight) and fat share depend on the macro style; carbs fill the rest
+  const style = MACRO_STYLE[p.macro_style ?? "balanced"];
   const proteinBase = Math.min(p.weight_kg, Math.max(p.goal_weight_kg, p.weight_kg * 0.85));
-  const protein_g = Math.round(proteinBase * 1.6);
-  const fat_g = Math.round((calories * 0.27) / 9);
+  const protein_g = Math.round(proteinBase * style.proteinPerKg);
+  const fat_g = Math.round((calories * style.fatShare) / 9);
   const carbs_g = Math.max(0, Math.round((calories - protein_g * 4 - fat_g * 9) / 4));
 
   return {
