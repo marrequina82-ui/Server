@@ -1,28 +1,24 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { hfLabel, hfMeal, hfModelName } from "./hf.js";
+import { hfLabel, hfMeal, hfModelName, toLabel } from "./hf.js";
 import { geminiLabel, geminiMeal } from "./gemini.js";
 
 export { AiError } from "./hf.js";
 
-// AI_PROVIDER in .env: "claude" (default), "hf" (free Hugging Face models) or "gemini" (Google Gemini).
+// AI_PROVIDER in .env: "claude" (default), "hf" (free Hugging Face models), "gemini" (Google Gemini), or "ollama" (local Qwen).
 // Read on each call so changing .env and restarting is all it takes.
-function provider(): "claude" | "hf" | "gemini" {
+function provider(): "claude" | "hf" | "gemini" | "ollama" {
   const p = process.env.AI_PROVIDER?.trim().toLowerCase();
-  return p === "hf" || p === "gemini" ? p : "claude";
+  return p === "hf" || p === "gemini" || p === "ollama" ? p : "claude";
 }
 export function aiProviderName(): string {
   if (provider() === "hf") return `hf (${hfModelName()})`;
   if (provider() === "gemini") return `gemini (${process.env.GEMINI_MODEL ?? "gemini-3.7-flash"})`;
-  return `claude (${process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5-5"})`;
+  if (provider() === "ollama") {
+    const url = process.env.OLLAMA_URL ?? "http://localhost:11434";
+    return `ollama qwen (${url})`;
+  }
+  const n8nUrl = process.env.N8N_BASE_URL ?? "http://localhost:5678";
+  return `claude via n8n (${n8nUrl})`;
 }
-
-// Created on first Claude call, so an HF-only setup doesn't need an Anthropic key.
-let client: Anthropic | null = null;
-function claude(): Anthropic {
-  client ??= new Anthropic(); // reads ANTHROPIC_API_KEY from env
-  return client;
-}
-const MODEL = () => process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5-5";
 
 type MediaType = "image/jpeg" | "image/png" | "image/webp";
 
@@ -53,88 +49,119 @@ export interface LabelAnalysis {
   protein_g: number;
   carbs_g: number;
   fat_g: number;
-  fiber_g: number | null;
-  sugar_g: number | null;
-  sodium_mg: number | null;
   notes: string;
 }
 
-const num = { type: "number" } as const;
+type Tool = { name: string };
 
-const MEAL_TOOL: Anthropic.Tool = {
-  name: "report_meal",
-  description: "Report the foods identified in the meal photo with grams, calories and macros for each.",
-  input_schema: {
-    type: "object",
-    properties: {
-      is_food: { type: "boolean", description: "false if the photo does not show food" },
-      meal_name: { type: "string", description: "Short name for the whole plate, e.g. 'Chicken adobo with rice'" },
-      items: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            name: { type: "string" },
-            grams: num,
-            kcal: num,
-            protein_g: num,
-            carbs_g: num,
-            fat_g: num,
-          },
-          required: ["name", "grams", "kcal", "protein_g", "carbs_g", "fat_g"],
-        },
-      },
-      total_grams: num,
-      confidence: { type: "string", enum: ["low", "medium", "high"] },
-      notes: { type: "string", description: "One short sentence on assumptions (cooking oil, sauce, hidden ingredients)." },
-    },
-    required: ["is_food", "meal_name", "items", "total_grams", "confidence", "notes"],
-  },
-};
+const MEAL_TOOL: Tool = { name: "report_meal" };
+const LABEL_TOOL: Tool = { name: "report_label" };
 
-const LABEL_TOOL: Anthropic.Tool = {
-  name: "report_label",
-  description: "Report the values printed on the Nutrition Facts label, per ONE serving.",
-  input_schema: {
-    type: "object",
-    properties: {
-      is_label: { type: "boolean", description: "false if no readable nutrition label is visible" },
-      product_name: { type: "string", description: "Product name if visible, otherwise a short guess or 'Packaged food'" },
-      serving_desc: { type: "string", description: "Serving size exactly as printed, e.g. '1 cup (240 mL)'" },
-      serving_g: { type: ["number", "null"], description: "Serving size in grams (or mL for drinks) if printed" },
-      servings_per_container: { type: ["number", "null"] },
-      kcal: num,
-      protein_g: num,
-      carbs_g: num,
-      fat_g: num,
-      fiber_g: { type: ["number", "null"] },
-      sugar_g: { type: ["number", "null"] },
-      sodium_mg: { type: ["number", "null"] },
-      notes: { type: "string", description: "Mention anything unreadable or estimated. Convert kJ to kcal if only kJ is shown." },
-    },
-    required: ["is_label", "product_name", "serving_desc", "serving_g", "servings_per_container", "kcal", "protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g", "sodium_mg", "notes"],
-  },
-};
+async function callWithImage<T>(tool: { name: string }, imageBase64: string, mediaType: MediaType, prompt: string): Promise<T> {
+  if (provider() === "ollama") {
+    return callOllama<T>(imageBase64, mediaType, prompt);
+  }
 
-async function callWithImage<T>(tool: Anthropic.Tool, imageBase64: string, mediaType: MediaType, prompt: string): Promise<T> {
-  const res = await claude().messages.create({
-    model: MODEL(),
-    max_tokens: 1500,
-    tools: [tool],
-    tool_choice: { type: "tool", name: tool.name },
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "image", source: { type: "base64", media_type: mediaType, data: imageBase64 } },
-          { type: "text", text: prompt },
-        ],
-      },
-    ],
-  });
-  const block = res.content.find((b) => b.type === "tool_use");
-  if (!block || block.type !== "tool_use") throw new Error("AI did not return structured output");
-  return block.input as T;
+  const n8nUrl = process.env.N8N_BASE_URL ?? "http://localhost:5678";
+  const webhookPath = tool.name === "report_meal" ? "fittonesugo-meal" : "fittonesugo-label";
+  const url = `${n8nUrl}/webhook/${webhookPath}`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60_000); // 60s timeout
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image_base64: imageBase64,
+        media_type: mediaType,
+        prompt,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`n8n error (HTTP ${response.status}): ${text || "unknown error"}`);
+    }
+
+    const data = await response.json();
+    return data as T;
+  } catch (e) {
+    if (e instanceof TypeError && e.message.includes("fetch")) {
+      throw new Error(`Cannot reach n8n at ${url}. Is n8n running? Start with: npx n8n`);
+    }
+    throw e;
+  }
+}
+
+async function callOllama<T>(imageBase64: string, mediaType: MediaType, prompt: string): Promise<T> {
+  const ollamaUrl = process.env.OLLAMA_URL ?? "http://localhost:11434";
+  const model = process.env.OLLAMA_MODEL ?? "llava";
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 180_000); // 3 minutes for Llava
+
+    const response = await fetch(`${ollamaUrl}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        prompt: `${prompt}
+
+RESPOND WITH ONLY valid JSON in this exact format, no other text:
+{"is_food":true,"meal_name":"dish name","items":[{"name":"item","grams":100,"kcal":200,"protein_g":10,"carbs_g":30,"fat_g":5}],"total_grams":100,"confidence":"high","notes":"assumptions"}
+
+Change only the values, keep the field names exactly as shown.`,
+        images: [imageBase64],
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Ollama error (HTTP ${response.status}): ${errorText}`);
+    }
+
+    const data = await response.json();
+    const responseText = (data.response || "").trim();
+
+    // Parse JSON from Qwen's response
+    try {
+      // Find JSON: match from first { to the last }
+      const firstBrace = responseText.indexOf("{");
+      const lastBrace = responseText.lastIndexOf("}");
+
+      if (firstBrace === -1 || lastBrace === -1) {
+        throw new Error("No JSON braces found in response");
+      }
+
+      let jsonStr = responseText.substring(firstBrace, lastBrace + 1);
+
+      // Clean up Qwen's JSON formatting issues:
+      // Remove spaces around underscores in field names
+      jsonStr = jsonStr.replace(/"([a-z]+)_ ([a-z_]+)":/g, '"$1_$2":');
+
+      // Remove extra closing braces
+      jsonStr = jsonStr.replace(/\}\}+$/, "}");
+
+      return JSON.parse(jsonStr) as T;
+    } catch (e) {
+      throw new Error(`Failed to parse Qwen response as JSON: ${(e as Error).message}\nResponse: ${responseText.substring(0, 300)}`);
+    }
+  } catch (e) {
+    if (e instanceof TypeError) {
+      throw new Error(`Cannot reach Ollama at ${ollamaUrl}. Is it running? Start with: ollama serve`);
+    }
+    throw e;
+  }
 }
 
 /** If the user gave a total weight, rescale the items so their grams match it exactly. Shared by both providers. */
@@ -165,6 +192,22 @@ export async function analyzeMeal(imageBase64: string, mediaType: MediaType, tot
   if (provider() === "gemini") {
     return applyTotalGrams(await geminiMeal(imageBase64, totalGrams, note), totalGrams);
   }
+  if (provider() === "ollama") {
+    // Ollama path - uses callWithImage which calls local Qwen model
+    const weightLine = totalGrams
+      ? `The user weighed/estimated the WHOLE plate at ${totalGrams} g. Split this total across the items so item grams add up to ${totalGrams} g, then compute calories and macros from those grams.`
+      : "The user did not give a weight. Estimate each item's grams from typical portion sizes and visual cues.";
+    const noteLine = note ? `User note about the meal: "${note}".` : "";
+    const prompt = [
+      "You are a nutrition assistant inside a calorie-tracking app used mostly in the Philippines.",
+      "Identify every distinct food in this photo (recognize Filipino dishes by name when relevant, e.g. adobo, sinigang, pancit).",
+      weightLine,
+      noteLine,
+      "Use standard nutrition references for cooked foods as served, including typical cooking oil and sauces. Round kcal to whole numbers and macros to one decimal.",
+    ].filter(Boolean).join("\n");
+    const out = await callWithImage<MealAnalysis>(MEAL_TOOL, imageBase64, mediaType, prompt);
+    return applyTotalGrams(out, totalGrams);
+  }
 
   const weightLine = totalGrams
     ? `The user weighed/estimated the WHOLE plate at ${totalGrams} g. Split this total across the items so item grams add up to ${totalGrams} g, then compute calories and macros from those grams.`
@@ -186,9 +229,10 @@ export async function analyzeLabel(imageBase64: string, mediaType: MediaType): P
   if (provider() === "gemini") return geminiLabel(imageBase64);
 
   const prompt =
-    "Read the Nutrition Facts / Nutrition Information label in this photo. Report values for ONE serving as printed. " +
+    "Read the Nutrition Facts / Nutrition Information label in this photo. Report only calories, protein, carbs and fat for ONE serving as printed. " +
     "If the label only shows per-100 g values, report per 100 g and set serving_desc to '100 g' and serving_g to 100. Do not guess values that are not visible; use null for optional fields you cannot read.";
-  return callWithImage<LabelAnalysis>(LABEL_TOOL, imageBase64, mediaType, prompt);
+  return toLabel(await callWithImage<unknown>(LABEL_TOOL, imageBase64, mediaType, prompt));
 }
+
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
